@@ -833,20 +833,64 @@ const PDF_FONT_B = "AAEAAAALAIAAAwAwT1MvMtrL31sAAAE4AAAAYGNtYXBue0+UAAAukAAANwhn
             }, 400);
         }
 
+        // ===== 구글 시트(Apps Script) 공유 저장 =====
+        const SHEET_URL = 'https://script.google.com/macros/s/AKfycbyowjcm38nTtHQ7LoFF6TKbrTYcqbmdonrxOJknjANHExIYGouU1MqklBrULmvOy4VX/exec';
+        let sheetTs = 0;
+        function sheetKey() {
+            let k = localStorage.getItem('dash_key');
+            if (!k) { k = prompt('비밀번호를 입력하세요'); if (k) localStorage.setItem('dash_key', k); }
+            return k;
+        }
+        async function sheetApi(action, body) {
+            const k = encodeURIComponent(sheetKey() || '');
+            let r;
+            if (body) r = await fetch(SHEET_URL + '?key=' + k, { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: JSON.stringify(body) });
+            else r = await fetch(SHEET_URL + '?key=' + k + '&action=' + action + '&_=' + Date.now());
+            const j = await r.json();
+            if (j && j.error === 'auth') { localStorage.removeItem('dash_key'); throw new Error('auth'); }
+            return j;
+        }
+        function makeSheetDoc() {
+            return {
+                async get() {
+                    const r = await sheetApi('get');
+                    if (!r.ok) throw new Error(r.error || 'get 실패');
+                    sheetTs = r.ts;
+                    return { exists: !!r.exists, data: () => ({ payload: r.payload }) };
+                },
+                async set(o) {
+                    const r = await sheetApi('set', { payload: o.payload, baseTs: sheetTs });
+                    if (!r.ok) throw new Error(r.conflict ? 'conflict(다른 사람이 먼저 수정함)' : (r.error || 'set 실패'));
+                    sheetTs = r.ts;
+                },
+                onSnapshot(cb, errCb) {
+                    setInterval(async () => {
+                        if (pushTimer) return;
+                        try {
+                            const t = await sheetApi('ts');
+                            if (t.ok && t.ts > sheetTs) {
+                                const r = await sheetApi('get');
+                                if (r.ok) { sheetTs = r.ts; cb({ exists: true, data: () => ({ payload: r.payload }) }); }
+                            }
+                        } catch (e) { if (errCb) errCb(e); }
+                    }, 10000);
+                }
+            };
+        }
+
         async function initShared() {
             try {
-                if (!window.claude || !window.claude.use) { setSyncStatus('개인 저장 모드', true); return; }
-                const dbNs = await window.claude.use('db');
-                if (!dbNs) { setSyncStatus('개인 저장 모드', true); return; }
-                const user = await window.claude.use('user');
-                const owner = user ? await user.isOwner() : false;
-                sharedDoc = dbNs.doc('dashboard/state');
+                if (!SHEET_URL || SHEET_URL.indexOf('여기에') === 0) { setSyncStatus('개인 저장 모드', true); return; }
+                sharedDoc = makeSheetDoc();
                 const snap = await sharedDoc.get();
-                if (!snap.exists && owner) {
-                    // 최초 1회: 소유자의 현재 데이터를 공유 저장소에 시드
+                if (!snap.exists) {
                     const payload = JSON.stringify(db);
                     await sharedDoc.set({ payload: payload, updatedAt: Date.now() });
                     lastSynced = payload;
+                } else {
+                    lastSynced = snap.data().payload;
+                    db = JSON.parse(lastSynced);
+                    refreshAll();
                 }
                 setSyncStatus('공유 연결됨');
                 sharedDoc.onSnapshot(s => {
@@ -857,11 +901,13 @@ const PDF_FONT_B = "AAEAAAALAIAAAwAwT1MvMtrL31sAAAE4AAAAYGNtYXBue0+UAAAukAAANwhn
                         db = JSON.parse(p);
                         lastSynced = p;
                         refreshAll();
+                        setSyncStatus('공유 연결됨');
                     } catch(e) { console.error(e); }
                 }, err => { console.error(err); setSyncStatus('공유 연결 끊김', true); });
             } catch(e) {
                 console.error("공유 초기화 실패", e);
-                setSyncStatus('개인 저장 모드', true);
+                sharedDoc = null;
+                setSyncStatus(e && e.message === 'auth' ? '비밀번호 오류(새로고침)' : '개인 저장 모드', true);
             }
         }
 
